@@ -18,6 +18,7 @@
 #include <boost/property_tree/xml_parser.hpp>
 
 #include <boost/thread/mutex.hpp>
+#include <boost/thread.hpp>
 
 //PCL Includes
 #include <pcl/ModelCoefficients.h>
@@ -79,6 +80,12 @@
 #include "pxchanddata.h"
 #include "pxchandconfiguration.h"
 
+//OSC Includes
+#include "osc/OscReceivedElements.h"
+#include "osc/OscPacketListener.h"
+#include "osc/OscOutboundPacketStream.h"
+#include "ip/UdpSocket.h"
+
 typedef pcl::PointXYZRGBA RefPointType;
 typedef pcl::PointCloud<RefPointType> Cloud;
 typedef pcl::PointCloud<pcl::PointXYZ> BWCloud;
@@ -118,6 +125,7 @@ float model_plane_threshold(0.005);
 bool hands_available(false);
 bool fake_search(false);
 std::string search_obj;
+int PORT(7000);
 
 //Objects
 Cloud::Ptr cloud_pass_;
@@ -130,6 +138,13 @@ std::string object_clouds_location_("pointclouds");
 std::string coef_point_filename_("relLocation.txt");
 boost::format object_locator_("%s/%s");
 int poss_objects_(0);
+
+//OSC Temp
+boost::mutex oscMutex;
+bool a1;
+osc::int32 a2;
+float a3;
+const char *a4;
 
 //Helper Functions----------------------------------------------------------------------//
 void print_with_level(int level,const char* output){
@@ -332,7 +347,6 @@ struct point_indices_descending_size_sort
 };
 
 //Real Functions------------------------------------------------------------------------//
-
 void filterPassThrough(const Cloud::ConstPtr &cloud, Cloud &result)
 {
 	pcl::PassThrough<pcl::PointXYZRGBA> pass;
@@ -427,8 +441,6 @@ Eigen::Vector3f rgbToHSL(float r, float g, float b){
 	float h(0.0f);
 	float s(0.0f);
 
-	cout << "RGB ratios to Convert: " << r << ", " << g << ", " << b << endl;
-
 	if(r>=g&&r>=b){
 		max_int=0;
 		max=r;
@@ -445,14 +457,9 @@ Eigen::Vector3f rgbToHSL(float r, float g, float b){
 
 	float delta(max-min);
 
-	cout << "Max, min, delta, maxint: " << max << ", " << min << ", " << delta << ", " << max_int << endl;
-
 	float l((min+max)/2.0f);
 
 	if(delta!=0.0f){
-
-		print_with_level(5, "Delta is not 0\n");
-
 		switch(max_int){
 		case 0:{
 			float mod(std::fmod((g-b)/delta,6));
@@ -470,9 +477,8 @@ Eigen::Vector3f rgbToHSL(float r, float g, float b){
 		}
 		s=(delta/(1.0f-std::abs((2.0f*l)-1)));
 	}
-	cout << "HSL Result: " << h << ", " << s << ", " << l << endl;
-	return Eigen::Vector3f(h,s,l);
 
+	return Eigen::Vector3f(h,s,l);
 }
 
 pxcCHAR* GestureStateToString(PXCHandData::GestureStateType label)
@@ -536,7 +542,7 @@ struct BoxPartPlane{
 BoxPartPlane::BoxPartPlane(){};
 
 BoxPartPlane::BoxPartPlane(const BoxPartPlane& bpp){
-	centroid				=bpp.centroid				;
+	centroid					=bpp.centroid				;
 	coeffs					=bpp.coeffs					;
 	points					=bpp.points					;
 	flatRectangleVertices	=bpp.flatRectangleVertices	;
@@ -631,6 +637,54 @@ struct SimpleHand{
 	int openness;
 };
 
+class DMRPacketListener : public osc::OscPacketListener {
+protected:
+
+	virtual void ProcessMessage( const osc::ReceivedMessage& m, 
+		const IpEndpointName& remoteEndpoint )
+	{
+		(void) remoteEndpoint;
+
+		try{       
+			search_obj=m.AddressPattern();
+			if( std::strcmp( m.AddressPattern(), "/test1" ) == 0 ){
+				osc::ReceivedMessageArgumentStream args = m.ArgumentStream();
+				oscMutex.lock();
+				args >> a1 >> a2 >> a3 >> a4 >> osc::EndMessage;
+				search_obj=a4;
+				oscMutex.unlock();
+				std::cout << "received '/test1' message with arguments: "
+					<< a1 << " " << a2 << " " << a3 << " " << a4 << "\n";
+
+			}else if( std::strcmp( m.AddressPattern(), "/test2" ) == 0 ){
+				osc::ReceivedMessage::const_iterator arg = m.ArgumentsBegin();
+				oscMutex.lock();
+				a1 = (arg++)->AsBool();
+				a2 = (arg++)->AsInt32();
+				a3 = (arg++)->AsFloat();
+				a4 = (arg++)->AsString();
+				search_obj=a4;
+				oscMutex.unlock();
+				if( arg != m.ArgumentsEnd() )
+					throw osc::ExcessArgumentException();
+				std::cout << "received '/test2' message with arguments: "
+					<< a1 << " " << a2 << " " << a3 << " " << a4 << "\n";
+			}
+		}catch( osc::Exception& e ){
+			std::cout << "error while parsing message: "
+				<< m.AddressPattern() << ": " << e.what() << "\n";
+		}
+	}
+};
+
+void DMRListener(){
+	DMRPacketListener listener;
+	UdpListeningReceiveSocket s(
+		IpEndpointName( IpEndpointName::ANY_ADDRESS, PORT ),
+		&listener );
+	s.Run();
+}
+
 //SearchParameters
 //3 options, 0. none, 1. single/specific list of objects, 2. all/availability search
 int search_mode_(0);
@@ -655,7 +709,7 @@ public:
 		, numHands(0)
 	{
 		viewer_.registerKeyboardCallback (&RealSenseTracker::keyboardCallback, *this);
-		viewer_.setBackgroundColor(0.2,0.2,0.25);
+		viewer_.setBackgroundColor(0,0,0);
 		viewer_.setRepresentationToWireframeForAllActors();
 	}
 
@@ -671,7 +725,6 @@ public:
 		connection_ = grabber_.registerCallback (f);
 		grabber_.start ();
 
-		viewer_.setRepresentationToWireframeForAllActors();
 		//Insert hand grabbing info here
 		g_session = PXCSession::CreateInstance();
 		if(!g_session)
@@ -920,53 +973,53 @@ private:
 					std::vector<pcl::PointCloud<pcl::PointXYZRGBA>::Ptr> cluster_clouds_;
 
 					{
-					int j=0;
-					for (std::vector<pcl::PointIndices>::const_iterator it = cluster_indices.begin (); it != cluster_indices.end (); ++it)
-					{
-						clock_t validation = clock();
-						pcl::PointCloud<pcl::PointXYZRGBA>::Ptr cluster_cloud_ (new pcl::PointCloud<pcl::PointXYZRGBA>);
-						for (std::vector<int>::const_iterator pit = it->indices.begin (); pit != it->indices.end (); ++pit)
-							cluster_cloud_->points.push_back (filtered_cloud_->points[*pit]);
-						printf("Cluster Cloud has %i points\n",cluster_cloud_->points.size());
+						int j=0;
+						for (std::vector<pcl::PointIndices>::const_iterator it = cluster_indices.begin (); it != cluster_indices.end (); ++it)
+						{
+							clock_t validation = clock();
+							pcl::PointCloud<pcl::PointXYZRGBA>::Ptr cluster_cloud_ (new pcl::PointCloud<pcl::PointXYZRGBA>);
+							for (std::vector<int>::const_iterator pit = it->indices.begin (); pit != it->indices.end (); ++pit)
+								cluster_cloud_->points.push_back (filtered_cloud_->points[*pit]);
+							printf("Cluster Cloud has %i points\n",cluster_cloud_->points.size());
 
-						if(plane_vision_){
-							//Calculate Cluster Centroid
-							Eigen::Vector4f cluster_centroid_;
-							pcl::compute3DCentroid<pcl::PointXYZRGBA>(*cluster_cloud_, cluster_centroid_);
-							pcl::PointXYZRGBA centroid_;
-							centroid_.x=cluster_centroid_[0];
-							centroid_.y=	cluster_centroid_[1];
-							centroid_.z=cluster_centroid_[2];
+							if(plane_vision_){
+								//Calculate Cluster Centroid
+								Eigen::Vector4f cluster_centroid_;
+								pcl::compute3DCentroid<pcl::PointXYZRGBA>(*cluster_cloud_, cluster_centroid_);
+								pcl::PointXYZRGBA centroid_;
+								centroid_.x=cluster_centroid_[0];
+								centroid_.y=	cluster_centroid_[1];
+								centroid_.z=cluster_centroid_[2];
 
 
-							//Add centroid to existing hull points
-							pcl::PointCloud<pcl::PointXYZRGBA>::Ptr projection_cloud_(new pcl::PointCloud<pcl::PointXYZRGBA>);
-							pcl::copyPointCloud(*projected_plane_cloud_,*projection_cloud_);
-							projection_cloud_->push_back(centroid_);
+								//Add centroid to existing hull points
+								pcl::PointCloud<pcl::PointXYZRGBA>::Ptr projection_cloud_(new pcl::PointCloud<pcl::PointXYZRGBA>);
+								pcl::copyPointCloud(*projected_plane_cloud_,*projection_cloud_);
+								projection_cloud_->push_back(centroid_);
 
-							//printf("Projection Cloud has %i points\n",projection_cloud_->points.size());
-							pcl::PointCloud<pcl::PointXYZRGBA>::Ptr test_hull_ (new pcl::PointCloud<pcl::PointXYZRGBA>);
-							proj.setInputCloud (projection_cloud_);
-							proj.filter (*test_hull_);
-							//printf("Projected Cloud has %i points\n",test_hull_->points.size());
+								//printf("Projection Cloud has %i points\n",projection_cloud_->points.size());
+								pcl::PointCloud<pcl::PointXYZRGBA>::Ptr test_hull_ (new pcl::PointCloud<pcl::PointXYZRGBA>);
+								proj.setInputCloud (projection_cloud_);
+								proj.filter (*test_hull_);
+								//printf("Projected Cloud has %i points\n",test_hull_->points.size());
 
-							chull.setInputCloud(test_hull_);
-							chull.reconstruct(*test_hull_);
-							//printf("Test Hull Cloud has %i points\n",test_hull_->points.size());
+								chull.setInputCloud(test_hull_);
+								chull.reconstruct(*test_hull_);
+								//printf("Test Hull Cloud has %i points\n",test_hull_->points.size());
 
-							if(test_hull_->points.size()==base_cloud_hull_->points.size()){
+								if(test_hull_->points.size()==base_cloud_hull_->points.size()){
+									cluster_clouds_.push_back(cluster_cloud_);
+									*objects_cloud_+=*cluster_cloud_;
+								}
+
+							}else{
 								cluster_clouds_.push_back(cluster_cloud_);
-								*objects_cloud_+=*cluster_cloud_;
 							}
 
-						}else{
-							cluster_clouds_.push_back(cluster_cloud_);
+							printf("Cluster %i validation time taken: %.3fs\n",j, (double)(clock() - validation) / CLOCKS_PER_SEC);
+
+							j++;
 						}
-
-						printf("Cluster %i validation time taken: %.3fs\n",j, (double)(clock() - validation) / CLOCKS_PER_SEC);
-
-						j++;
-					}
 					}
 
 					//Search mode switch
@@ -1220,7 +1273,7 @@ private:
 											float totNumPts(0);
 
 											for(int i=0;i<3;++i){
-												
+
 
 												totNumPts+=float(box.faces[i].points->points.size());
 												for(int j=0;j<box.faces[i].points->points.size();++j){
@@ -1885,13 +1938,9 @@ int main (int argc, char** argv)
 					if(boost::filesystem::is_regular_file(indi_file_) && (0==boost::filesystem::extension(indi_file_).compare(file_ending_)))	{
 
 						cout << "XML File :" << indi_file_ << endl;
-
-
-
 						boost::property_tree::ptree pt;
 						boost::property_tree::read_xml(indi_file_.string(), pt);
 						std::string name = pt.get<std::string>("box.name");
-
 						PrimitiveBox pb(pt.get<float>("box.dimensions.l",0.0f),pt.get<float>("box.dimensions.w",0.0f),pt.get<float>("box.dimensions.h",0.0f));
 						pb.approach=pcl::PointXYZ(pt.get<float>("box.approach.x",0.0f),pt.get<float>("box.approach.y",0.0f),pt.get<float>("box.approach.z",0.0f));
 						cout<<"Creation Complete"<<endl;
@@ -1937,6 +1986,9 @@ int main (int argc, char** argv)
 	col_lib.add(PrimitiveColour("Blue",150,250,Eigen::Vector3d(0,0,1)));
 	col_lib.add(PrimitiveColour("Purple",250,290,Eigen::Vector3d(0.62,0,1)));
 	col_lib.add(PrimitiveColour("Pink",290,340,Eigen::Vector3d(1,0,1)));
+
+	//Start OSC Server
+	boost::thread oscServer(DMRListener);
 
 	std::string device_id = "";
 	try{
