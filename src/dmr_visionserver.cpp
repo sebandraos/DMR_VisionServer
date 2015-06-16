@@ -85,6 +85,11 @@
 #include "osc/OscPacketListener.h"
 #include "osc/OscOutboundPacketStream.h"
 #include "ip/UdpSocket.h"
+#define ADDRESS "192.168.125.255"
+#define PORTIN 7000
+#define PORTOUT 7001
+
+#define OUTPUT_BUFFER_SIZE 1024
 
 typedef pcl::PointXYZRGBA RefPointType;
 typedef pcl::PointCloud<RefPointType> Cloud;
@@ -125,7 +130,7 @@ float model_plane_threshold(0.005);
 bool hands_available(false);
 bool fake_search(false);
 std::string search_obj;
-int PORT(7000);
+bool transmit(false);
 
 //Objects
 Cloud::Ptr cloud_pass_;
@@ -138,6 +143,7 @@ std::string object_clouds_location_("pointclouds");
 std::string coef_point_filename_("relLocation.txt");
 boost::format object_locator_("%s/%s");
 int poss_objects_(0);
+int out_file_num(0);
 
 //OSC Temp
 boost::mutex oscMutex;
@@ -527,6 +533,7 @@ PrimitiveColour ColourLibrary::getColour(float h){
 			return *cit;
 		}
 	}
+	return colour_library[0];
 };
 
 struct BoxPartPlane{
@@ -559,7 +566,9 @@ struct Box{
 	float length;
 	float height;
 	Eigen::Matrix4f transformation_matrix;
+	Eigen::Quaternionf quaternion;
 	void calcVerts();
+	void calcQuat();
 	std::vector<float> dims;
 	std::vector<Eigen::Vector3f> axes;
 	bool valid_box;
@@ -607,6 +616,10 @@ void Box::calcVerts(){
 
 }
 
+void Box::calcQuat(){
+	quaternion=Eigen::Quaternionf(transformation_matrix.block<3,3>(0,0));
+}
+
 struct PrimitiveBox{
 	PrimitiveBox();
 	PrimitiveBox(float,float,float);
@@ -638,6 +651,7 @@ struct SimpleHand{
 };
 
 class DMRPacketListener : public osc::OscPacketListener {
+
 protected:
 
 	virtual void ProcessMessage( const osc::ReceivedMessage& m, 
@@ -646,17 +660,17 @@ protected:
 		(void) remoteEndpoint;
 
 		try{       
-			search_obj=m.AddressPattern();
-			if( std::strcmp( m.AddressPattern(), "/test1" ) == 0 ){
+			search_obj=m.AddressPattern();		
+			if( std::strcmp( m.AddressPattern(), "/test2" ) == 0 ){
 				osc::ReceivedMessageArgumentStream args = m.ArgumentStream();
 				oscMutex.lock();
-				args >> a1 >> a2 >> a3 >> a4 >> osc::EndMessage;
+				args >> a4 >> osc::EndMessage;
 				search_obj=a4;
 				oscMutex.unlock();
 				std::cout << "received '/test1' message with arguments: "
-					<< a1 << " " << a2 << " " << a3 << " " << a4 << "\n";
-
-			}else if( std::strcmp( m.AddressPattern(), "/test2" ) == 0 ){
+					<< a4 << "\n";
+				transmit=true;
+			}else if( std::strcmp( m.AddressPattern(), "/test1" ) == 0 ){
 				osc::ReceivedMessage::const_iterator arg = m.ArgumentsBegin();
 				oscMutex.lock();
 				a1 = (arg++)->AsBool();
@@ -680,8 +694,7 @@ protected:
 void DMRListener(){
 	DMRPacketListener listener;
 	UdpListeningReceiveSocket s(
-		IpEndpointName( IpEndpointName::ANY_ADDRESS, PORT ),
-		&listener );
+		IpEndpointName( IpEndpointName::ANY_ADDRESS, PORTIN ),&listener );
 	s.Run();
 }
 
@@ -707,10 +720,12 @@ public:
 		, objects_cloud_(new pcl::PointCloud<pcl::PointXYZRGBA>)
 		, surface_hull_(new pcl::PointCloud<pcl::PointXYZRGBA>)
 		, numHands(0)
+		, out_socket(IpEndpointName(ADDRESS,PORTOUT))
 	{
 		viewer_.registerKeyboardCallback (&RealSenseTracker::keyboardCallback, *this);
 		viewer_.setBackgroundColor(0,0,0);
 		viewer_.setRepresentationToWireframeForAllActors();
+		//out_socket.SetEnableBroadcast(true);
 	}
 
 	~RealSenseTracker ()
@@ -781,12 +796,12 @@ public:
 				print_with_level(3,"Got New Cloud\n");
 				boost::mutex::scoped_lock lock (new_cloud_mutex_);
 				print_with_level(4,"Updating Point Cloud?\n");
-				if (!viewer_.updatePointCloud (new_cloud_, "cloud"))
-				{
-					print_with_level(4,"Updating Point Cloud\n");
-					viewer_.addPointCloud (new_cloud_, "cloud");
-					viewer_.resetCamera ();
-				}
+				//if (!viewer_.updatePointCloud (new_cloud_, "cloud"))
+				//{
+				//	print_with_level(4,"Updating Point Cloud\n");
+				//	viewer_.addPointCloud (new_cloud_, "cloud");
+				//	viewer_.resetCamera ();
+				//}
 
 				//Visualisation
 				last_cloud_ = new_cloud_;
@@ -794,6 +809,19 @@ public:
 				drawFiltered(viewer_);
 				//drawInliers(viewer_, inliers);
 				displaySettings ();
+				if(transmit){
+					char buffer[OUTPUT_BUFFER_SIZE];
+					osc::OutboundPacketStream p( buffer, OUTPUT_BUFFER_SIZE );
+
+					p << osc::BeginBundleImmediate
+						<< osc::BeginMessage( "/io" ) 
+						<< "visserver" << (float)123.45 << (float)3.1415 << (float)19.765 << osc::EndMessage
+						/*<< osc::BeginMessage( "/test4" ) 
+						<< true << 24 << (float)10.8 << "world" << osc::EndMessage*/
+						<< osc::EndBundle;
+					out_socket.Send( p.Data(), p.Size() );
+					cout << "Sending OSC Message" << endl;
+				}
 
 				print_with_level(3,"Loop End\n");
 			}
@@ -934,7 +962,7 @@ private:
 					}
 
 					//Check for plane system
-					bool plane_vision_(plane_cloud_->points.size()>0);
+					plane_vision_=plane_cloud_->points.size()>0;
 
 					//Project Plane Points to plane
 					pcl::ProjectInliers<pcl::PointXYZRGBA> proj;
@@ -1545,7 +1573,7 @@ private:
 														Eigen::Vector3f yaxis(box.axes[lIndex]);
 														Eigen::Vector3f zaxis(box.axes[hIndex]);
 
-														float hSimZ(cosineSimilarity(zaxis,Eigen::Vector3f(0,0,-1)));
+														float hSimZ(cosineSimilarity(zaxis,Eigen::Vector3f(0,0,1)));
 														float hSimY(cosineSimilarity(zaxis,Eigen::Vector3f(0,1,0)));
 														float hSimX(cosineSimilarity(zaxis,Eigen::Vector3f(1,0,0)));
 
@@ -1573,6 +1601,7 @@ private:
 
 														box.transformation_matrix=boxTrans(zaxis,xaxis,box.centroid);
 														box.calcVerts();
+														box.calcQuat();
 														box.faces.clear();
 
 													}else{
@@ -1594,7 +1623,6 @@ private:
 									//End of for all clusters								
 								}
 
-
 								break;
 								//end of algorithm switch case 4
 								   }
@@ -1605,48 +1633,6 @@ private:
 							//End of Search switch cases 1/2
 						}
 						//End of search switch
-					}
-					//Output object centroid and plane coefficients
-					if(false){
-						std::ofstream out(coef_point_filename_);
-
-						out << scan_object_centroid_.x*1000 << " " 
-							<< scan_object_centroid_.y*1000 << " "
-							<< scan_object_centroid_.z*1000 << std::endl;
-
-						out << plane_vision_ << std::endl;
-
-						out << coefficients->values[0] << " " 
-							<< coefficients->values[1] << " "
-							<< coefficients->values[2] << " " 
-							<< coefficients->values[3] << std::endl;
-
-						//Setup TransforMatrix for Plane
-						Eigen::Vector3f base_zAxis(0,0,1);
-						Eigen::Vector3f zAxis(coefficients->values[0],-coefficients->values[1],coefficients->values[2]);
-						Eigen::Vector3f xAxis(zAxis.cross(base_zAxis));
-
-						xAxis.normalize();
-
-						Eigen::Vector3f yAxis(zAxis.cross(xAxis));
-						yAxis.normalize();
-
-						Eigen::Matrix3f rotMat;
-						rotMat.col(0)=xAxis;
-						rotMat.col(1)=yAxis;
-						rotMat.col(2)=zAxis;
-
-						Eigen::Quaternionf relQ(rotMat);
-						relQ.normalize();
-
-						out	<< rotMat << std::endl;
-
-						out << relQ.w() << " " 
-							<< relQ.x() << " "
-							<< relQ.y() << " "
-							<< relQ.z() << std::endl;
-
-						out.close();
 					}
 				}
 			}
@@ -1682,19 +1668,9 @@ private:
 				grabber_.setConfidenceThreshold (threshold_);
 			}
 
-			if (event.getKeyCode () == 'q')
-			{
-				search_mode_=0;
-			}
-
 			if (event.getKeyCode () == 'w')
 			{
 				search_mode_=1;
-			}
-
-			if (event.getKeyCode () == 'e')
-			{
-				search_mode_=2;
 			}
 
 			if (event.getKeyCode () == 'b')
@@ -1706,6 +1682,26 @@ private:
 			if (event.getKeyCode () == 'm')
 			{
 				hand_search=!hand_search;
+			}
+
+			if (event.getKeyCode () == 'l')
+			{
+				std::ofstream out((boost::format("%i_%s")%out_file_num%coef_point_filename_).str());
+				++out_file_num;
+
+				if(plane_vision_){
+					out << "Plane:\n" << "Coefficients: " << coefficients->values[0] << " " << coefficients->values[1] << " " << coefficients->values[2] << " " << coefficients->values[3] << std::endl;
+				}else{
+					out << "Plane:\n" << std::endl;
+				}
+				out << "Boxes: " << validBoxes.size() << std::endl;
+				for(int i=0; i<validBoxes.size();++i){
+					out << "Box: " << validBoxes[i].name << std::endl;
+					out	<< "Centroid: " << validBoxes[i].centroid.x*1000.0f << " " << validBoxes[i].centroid.y*1000.0f << " " << validBoxes[i].centroid.z*1000.0f << std::endl;
+					out << "Quaternion: " << validBoxes[i].quaternion.w() << " " << validBoxes[i].quaternion.x() << " " << validBoxes[i].quaternion.y() << " " << validBoxes[i].quaternion.z() << std::endl;
+					out << "Colour: " << validBoxes[i].reference_colour.name << std::endl;
+				}
+				out.close();
 			}
 
 			displaySettings ();
@@ -1896,10 +1892,13 @@ private:
 	pcl::PointIndices::Ptr inliers;
 	RefPointType scan_object_centroid_;
 	pcl::ModelCoefficients::Ptr coefficients;
+	bool plane_vision_;
 
 	std::vector<Box> boxes;
 	std::vector<Box> validBoxes;
 	std::vector<BoxPartPlane> subBoxes;
+
+	UdpTransmitSocket out_socket;
 
 	//Hands
 	PXCSession *g_session;
@@ -1989,7 +1988,7 @@ int main (int argc, char** argv)
 
 	//Start OSC Server
 	boost::thread oscServer(DMRListener);
-
+	print_with_level(2,"OSC Listener up and running\n");
 	std::string device_id = "";
 	try{
 		pcl::RealSenseGrabber grabber (device_id);
