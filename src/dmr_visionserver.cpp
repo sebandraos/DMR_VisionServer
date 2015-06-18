@@ -85,7 +85,7 @@
 #include "osc/OscPacketListener.h"
 #include "osc/OscOutboundPacketStream.h"
 #include "ip/UdpSocket.h"
-#define ADDRESS "192.168.125.255"
+#define ADDRESS "192.168.1.255"
 #define PORTIN 7000
 #define PORTOUT 7001
 
@@ -130,7 +130,14 @@ float model_plane_threshold(0.005);
 bool hands_available(false);
 bool fake_search(false);
 std::string search_obj;
+bool filter_by_colour(false);
+std::string colour_filter;
 bool transmit(false);
+bool approach(true);
+int lost_object_counter(0);
+float percentage_move(0.2);
+float minimum_move(0.01);
+pcl::PointXYZ offset(0,0,0.2);
 
 //Objects
 Cloud::Ptr cloud_pass_;
@@ -147,9 +154,6 @@ int out_file_num(0);
 
 //OSC Temp
 boost::mutex oscMutex;
-bool a1;
-osc::int32 a2;
-float a3;
 const char *a4;
 
 //Helper Functions----------------------------------------------------------------------//
@@ -498,6 +502,38 @@ pxcCHAR* GestureStateToString(PXCHandData::GestureStateType label)
 	}
 	return gestureState;
 }
+
+Eigen::Quaternionf slerpercentage(Eigen::Quaternionf quat, float percentage, float min){
+	Eigen::Quaternionf nQ(quat);
+
+	float cosHalfTheta(nQ.w());
+
+	if(std::abs(cosHalfTheta)>=1.0f) return nQ;
+
+	float halfTheta(std::acos(cosHalfTheta));
+	float pc(percentage);
+
+	if(halfTheta<min) pc=1.0f;
+
+	float sinHalfTheta(std::sqrt(1.0f-(cosHalfTheta*cosHalfTheta)));
+
+	if(std::abs(sinHalfTheta)<0.001f){
+	nQ.w()+=0.5f;
+	nQ.normalize();
+	return nQ;
+	}
+
+	float ratA(std::sin((1.0f-pc)*halfTheta)/sinHalfTheta);
+	float ratB(std::sin(pc*halfTheta)/sinHalfTheta);
+	nQ.w()=((ratA)+(nQ.w()*ratB));
+	nQ.x()*=ratB;
+	nQ.y()*=ratB;
+	nQ.z()*=ratB;
+	nQ.normalize();
+
+	return nQ;
+}
+
 //Classes------------------------------------------------------------------------------//
 struct PrimitiveColour{
 	PrimitiveColour();
@@ -576,6 +612,7 @@ struct Box{
 	float saturation;
 	float lightness;
 	PrimitiveColour reference_colour;
+	void movify();
 };
 
 Box::Box(){
@@ -620,6 +657,41 @@ void Box::calcQuat(){
 	quaternion=Eigen::Quaternionf(transformation_matrix.block<3,3>(0,0));
 }
 
+void Box::movify(){
+	
+quaternion=slerpercentage(quaternion,percentage_move,0.1);
+pcl::PointXYZ new_loc(centroid);
+if(approach){
+	Eigen::Vector3f zAxis(transformation_matrix.block<3,1>(0,2));
+	zAxis*=-0.15f;
+	new_loc.x+=zAxis.x();
+	new_loc.y+=zAxis.y();
+	new_loc.z+=zAxis.z();
+
+	Eigen::Vector3f relPos(new_loc.getVector3fMap());
+	if(relPos.norm()<=minimum_move){
+		approach=false;
+	}
+	relPos*=1000.0f;
+	relPos*=percentage_move;
+
+	centroid.x=relPos.x();
+	centroid.y=relPos.y();
+	centroid.z=relPos.z();
+
+}else{
+
+	Eigen::Vector3f relPos(new_loc.getVector3fMap());
+	relPos*=1000.0f;
+	relPos*=percentage_move;
+
+	centroid.x=relPos.x();
+	centroid.y=relPos.y();
+	centroid.z=relPos.z();
+
+}
+}
+
 struct PrimitiveBox{
 	PrimitiveBox();
 	PrimitiveBox(float,float,float);
@@ -648,7 +720,41 @@ struct SimpleHand{
 	Eigen::Quaternionf quat;
 	bool open;
 	int openness;
+	void movify();
 };
+
+void SimpleHand::movify(){
+quat=slerpercentage(quat,percentage_move,0.1);
+pcl::PointXYZ new_loc(centroid);
+if(approach){
+	normal*=0.15f;
+	new_loc.x+=normal.x();
+	new_loc.y+=normal.y();
+	new_loc.z+=normal.z();
+
+	Eigen::Vector3f relPos(new_loc.getVector3fMap());
+	if(relPos.norm()<=minimum_move){
+		approach=false;
+	}
+	relPos*=1000.0f;
+	relPos*=percentage_move;
+
+	centroid.x=relPos.x();
+	centroid.y=relPos.y();
+	centroid.z=relPos.z();
+
+}else{
+
+	Eigen::Vector3f relPos(new_loc.getVector3fMap());
+	relPos*=1000.0f;
+	relPos*=percentage_move;
+
+	centroid.x=relPos.x();
+	centroid.y=relPos.y();
+	centroid.z=relPos.z();
+
+}
+}
 
 class DMRPacketListener : public osc::OscPacketListener {
 
@@ -659,30 +765,39 @@ protected:
 	{
 		(void) remoteEndpoint;
 
-		try{       
-			search_obj=m.AddressPattern();		
-			if( std::strcmp( m.AddressPattern(), "/test2" ) == 0 ){
+		try{       	
+			if( std::strcmp( m.AddressPattern(), "/ping" ) == 0 ){
 				osc::ReceivedMessageArgumentStream args = m.ArgumentStream();
 				oscMutex.lock();
 				args >> a4 >> osc::EndMessage;
-				search_obj=a4;
 				oscMutex.unlock();
-				std::cout << "received '/test1' message with arguments: "
-					<< a4 << "\n";
 				transmit=true;
-			}else if( std::strcmp( m.AddressPattern(), "/test1" ) == 0 ){
+			}else if( std::strcmp( m.AddressPattern(), "/filter" ) == 0 ){
+				transmit=true;
+				lost_object_counter=0;
 				osc::ReceivedMessage::const_iterator arg = m.ArgumentsBegin();
+				int argNum(0);
 				oscMutex.lock();
-				a1 = (arg++)->AsBool();
-				a2 = (arg++)->AsInt32();
-				a3 = (arg++)->AsFloat();
-				a4 = (arg++)->AsString();
-				search_obj=a4;
+				for (osc::ReceivedMessage::const_iterator mit = m.ArgumentsBegin(); mit != m.ArgumentsEnd(); ++mit){
+					switch(argNum){
+					case 0:
+						search_obj=(*mit).AsString();
+						filter_by_colour=false;
+						approach=true;
+						if(std::strcmp(search_obj.c_str(),"hand") == 0){
+							hand_search=true;
+						}else{
+							hand_search=false;
+						}
+						break;
+					case 1:
+						colour_filter=(*mit).AsString();
+						filter_by_colour=true;
+						break;
+					}
+					argNum++;
+				}
 				oscMutex.unlock();
-				if( arg != m.ArgumentsEnd() )
-					throw osc::ExcessArgumentException();
-				std::cout << "received '/test2' message with arguments: "
-					<< a1 << " " << a2 << " " << a3 << " " << a4 << "\n";
 			}
 		}catch( osc::Exception& e ){
 			std::cout << "error while parsing message: "
@@ -812,15 +927,97 @@ public:
 				if(transmit){
 					char buffer[OUTPUT_BUFFER_SIZE];
 					osc::OutboundPacketStream p( buffer, OUTPUT_BUFFER_SIZE );
-
-					p << osc::BeginBundleImmediate
+					if(hand_search){
+						if(numHands>0){
+						SimpleHand closest;
+						float closest_dist(std::numeric_limits<float>::max());
+						for(std::vector<SimpleHand>::iterator cit=hands.begin(); cit!=hands.end(); ++cit){
+							SimpleHand h=*cit;
+							float dist(h.centroid.getVector3fMap().norm());
+							if(dist<closest_dist){
+								closest=h;
+								closest_dist=dist;
+							}
+						}
+						closest.movify();
+						if(closest.openness<60){
+							closest_dist+=100;
+						}else if(!approach && closest_dist<0.07){
+							closest_dist-=0.05;
+						}
+						p << osc::BeginBundleImmediate
 						<< osc::BeginMessage( "/io" ) 
-						<< "visserver" << (float)123.45 << (float)3.1415 << (float)19.765 << osc::EndMessage
-						/*<< osc::BeginMessage( "/test4" ) 
-						<< true << 24 << (float)10.8 << "world" << osc::EndMessage*/
+						<< "objdist" << (float)closest_dist << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objx" << (float)closest.centroid.x << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objy" << (float)closest.centroid.y << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objz" << (float)closest.centroid.z << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objq1" << (float)closest.quat.w() << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objq2" << (float)closest.quat.x() << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objq3" << (float)closest.quat.y() << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objq4" << (float)closest.quat.z() << osc::EndMessage
 						<< osc::EndBundle;
 					out_socket.Send( p.Data(), p.Size() );
-					cout << "Sending OSC Message" << endl;
+						}else{
+							lost_object_counter++;
+						}
+					}else if(!(std::strcmp(search_obj.c_str(),"")==0)){
+						if(validBoxes.size()>0){
+						Box closest;
+												float closest_dist(std::numeric_limits<float>::max());
+						for(std::vector<Box>::iterator cit=validBoxes.begin(); cit!=validBoxes.end(); ++cit){
+							Box b=*cit;
+							float dist(b.centroid.getVector3fMap().norm());
+							if(dist<closest_dist){
+								closest=b;
+								closest_dist=dist;
+							}
+						}
+						closest.movify();
+						p << osc::BeginBundleImmediate
+						<< osc::BeginMessage( "/io" ) 
+						<< "objdist" << (float)closest_dist << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objx" << (float)closest.centroid.x << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objy" << (float)closest.centroid.y << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objz" << (float)closest.centroid.z << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objq1" << (float)closest.quaternion.w() << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objq2" << (float)closest.quaternion.x() << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objq3" << (float)closest.quaternion.y() << osc::EndMessage
+						<< osc::BeginMessage( "/io" ) 
+						<< "objq4" << (float)closest.quaternion.z() << osc::EndMessage
+						<< osc::EndBundle;
+						out_socket.Send( p.Data(), p.Size() );
+						}else{
+							lost_object_counter++;
+						}
+					}
+					
+					//Create new message/bundle with coefficients closest point to 0,0,0's distance
+					char b[OUTPUT_BUFFER_SIZE];
+					osc::OutboundPacketStream d( b, OUTPUT_BUFFER_SIZE );
+					float dist(0);
+					if(plane_vision_){
+						dist=planeDist(*coefficients,pcl::PointXYZ(0,0,0.2));
+					}
+						d << osc::BeginBundleImmediate
+						<< osc::BeginMessage( "/io" ) 
+						<< "distance" << (float)dist << osc::EndMessage
+						<< osc::EndBundle;
+						out_socket.Send(d.Data(), d.Size());
+					
+					cout << "Sending OSC Messages" << endl;
 				}
 
 				print_with_level(3,"Loop End\n");
@@ -885,10 +1082,14 @@ private:
 
 									PXCPoint4DF32 palm_orientation=hand->QueryPalmOrientation();
 									Eigen::Quaternionf palm_up(palm_orientation.w,palm_orientation.x,palm_orientation.y,palm_orientation.z);
-									h.quat=palm_up;
-
+									
 									Eigen::Matrix3f hand_rot_mat=palm_up.toRotationMatrix();
 									h.normal=hand_rot_mat.block<3,1>(0,2);
+									hand_rot_mat.block<3,1>(0,2)*=-1.0f;
+									hand_rot_mat.block<3,1>(0,0)=Eigen::Vector3f(1.0f,0.0f,0.0f);
+									hand_rot_mat.block<3,1>(0,1)=hand_rot_mat.block<3,1>(0,2).cross(hand_rot_mat.block<3,1>(0,0));
+
+									h.quat=Eigen::Quaternionf(hand_rot_mat);
 
 									h.openness=hand->QueryOpenness();
 
@@ -1607,18 +1808,26 @@ private:
 													}else{
 
 													}
-													validBoxes.push_back(box);
+
+													bool filtered(false);
+													if(std::strcmp(box.name.c_str(),search_obj.c_str())==0){
+														if(filter_by_colour){
+															if(std::strcmp(box.reference_colour.name.c_str(),colour_filter.c_str())==0){
+																validBoxes.push_back(box);
+																filtered=true;
+															}
+														}else{
+															validBoxes.push_back(box);
+															filtered=true;
+														}
+													}
+													if(!filtered){
+														boxes.push_back(box);
+													}
 													break;
 												}
 											}
-
-											//If not found in lib I don't care about the object
-											if(!found_in_lib && box.valid_box){
-												box.name="?";
-												boxes.push_back(box);
-											}
 										}
-
 									}
 									//End of for all clusters								
 								}
@@ -1636,8 +1845,6 @@ private:
 					}
 				}
 			}
-
-
 			//file_cloud_cb<pcl::cuda::Device>(cloud);
 			got_new_cloud_ = true;
 			print_with_level(3,"Done With Callback\n");
@@ -1780,67 +1987,69 @@ private:
 		if(algorithm_==4){
 			boost::format cloud_labelling("box_%i_%s_%i_%i");
 
-			for(int i=0;i<validBoxes.size();++i){
-				print_with_level(4,"Valid box gen\n");
+			for(int i=0;i<boxes.size();++i){
+				print_with_level(4,"Box gen\n");
 
-				Eigen::Quaternionf relQ(validBoxes[i].transformation_matrix.block<3,3>(0,0));
-				relQ.normalize();
-				Eigen::Vector3f zAxisToTop(validBoxes[i].transformation_matrix.block<3,1>(0,2));
-				zAxisToTop*=((validBoxes[i].height+0.01f)*0.5f);
-				pcl::PointXYZ text_centroid(validBoxes[i].centroid.x+zAxisToTop.x(),validBoxes[i].centroid.y+zAxisToTop.y(),validBoxes[i].centroid.z+zAxisToTop.z());
+				Eigen::Vector3f zAxisToTop(boxes[i].transformation_matrix.block<3,1>(0,2));
+				zAxisToTop*=((validBoxes[i].height+0.01f)*(-0.5f));
+				pcl::PointXYZ text_centroid(boxes[i].centroid.x+zAxisToTop.x(),boxes[i].centroid.y+zAxisToTop.y(),boxes[i].centroid.z+zAxisToTop.z());
 
-				if(i==0 && fake_search){
-					boost::format obj_locator("%s\n\tM:%s\n\tM:%s\n\tM:%s\n\tqw:%.3f\n\tqx:%.3f\n\tqy:%.3f\n\tqz:%.3f");
+				std::string cubeName((cloud_labelling%i%"validbox"%0%0).str());
+				viz.addText3D((boost::format("%s_%s")%boxes[i].name%boxes[i].reference_colour.name).str(),text_centroid,0.01,1,1,1,(cloud_labelling%i%"name"%0%0).str());
+				//viz.addCube(validBoxes[i].centroid.getArray3fMap(), relQ, validBoxes[i].width, validBoxes[i].length, validBoxes[i].height,cubeName);
+				viz.addLine(boxes[i].verts[0],boxes[i].verts[1],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"ab"%0%0).str());
+				viz.addLine(boxes[i].verts[1],boxes[i].verts[2],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"bc"%0%0).str());
+				viz.addLine(boxes[i].verts[2],boxes[i].verts[3],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"cd"%0%0).str());
+				viz.addLine(boxes[i].verts[3],boxes[i].verts[0],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"da"%0%0).str());
 
-					viz.addText3D((obj_locator%validBoxes[i].name
-						%(validBoxes[i].centroid.z>0?"forward":"back")
-						%(validBoxes[i].centroid.y>0?"up":"down")
-						%(validBoxes[i].centroid.x>0?"right":"left")
-						%relQ.w()
-						%relQ.x()
-						%relQ.y()
-						%relQ.z()
-						).str(),text_centroid,0.01,255,255,255,(cloud_labelling%i%"name"%0%0).str());
+				viz.addLine(boxes[i].verts[4],boxes[i].verts[5],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"ef"%0%0).str());
+				viz.addLine(boxes[i].verts[5],boxes[i].verts[6],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"fg"%0%0).str());
+				viz.addLine(boxes[i].verts[6],boxes[i].verts[7],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"gh"%0%0).str());
+				viz.addLine(boxes[i].verts[7],boxes[i].verts[4],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"he"%0%0).str());
 
-					search_obj=validBoxes[i].name;
+				viz.addLine(boxes[i].verts[0],boxes[i].verts[4],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"ae"%0%0).str());
+				viz.addLine(boxes[i].verts[1],boxes[i].verts[5],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"bf"%0%0).str());
+				viz.addLine(boxes[i].verts[2],boxes[i].verts[6],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"cg"%0%0).str());
+				viz.addLine(boxes[i].verts[3],boxes[i].verts[7],boxes[i].reference_colour.rgb.x(),boxes[i].reference_colour.rgb.y(),boxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"dh"%0%0).str());
 
-					viz.addLine(validBoxes[i].verts[0],validBoxes[i].verts[1],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"ab"%0%0).str());
-					viz.addLine(validBoxes[i].verts[1],validBoxes[i].verts[2],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"bc"%0%0).str());
-					viz.addLine(validBoxes[i].verts[2],validBoxes[i].verts[3],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"cd"%0%0).str());
-					viz.addLine(validBoxes[i].verts[3],validBoxes[i].verts[0],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"da"%0%0).str());
-
-					viz.addLine(validBoxes[i].verts[4],validBoxes[i].verts[5],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"ef"%0%0).str());
-					viz.addLine(validBoxes[i].verts[5],validBoxes[i].verts[6],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"fg"%0%0).str());
-					viz.addLine(validBoxes[i].verts[6],validBoxes[i].verts[7],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"gh"%0%0).str());
-					viz.addLine(validBoxes[i].verts[7],validBoxes[i].verts[4],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"he"%0%0).str());
-
-					viz.addLine(validBoxes[i].verts[0],validBoxes[i].verts[4],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"ae"%0%0).str());
-					viz.addLine(validBoxes[i].verts[1],validBoxes[i].verts[5],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"bf"%0%0).str());
-					viz.addLine(validBoxes[i].verts[2],validBoxes[i].verts[6],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"cg"%0%0).str());
-					viz.addLine(validBoxes[i].verts[3],validBoxes[i].verts[7],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"dh"%0%0).str());
-
-				}else{
-
-					std::string cubeName((cloud_labelling%i%"validbox"%0%0).str());
-					viz.addText3D((boost::format("%s_%s")%validBoxes[i].name%validBoxes[i].reference_colour.name).str(),text_centroid,0.01,1,1,1,(cloud_labelling%i%"name"%0%0).str());
-					//viz.addCube(validBoxes[i].centroid.getArray3fMap(), relQ, validBoxes[i].width, validBoxes[i].length, validBoxes[i].height,cubeName);
-					viz.addLine(validBoxes[i].verts[0],validBoxes[i].verts[1],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"ab"%0%0).str());
-					viz.addLine(validBoxes[i].verts[1],validBoxes[i].verts[2],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"bc"%0%0).str());
-					viz.addLine(validBoxes[i].verts[2],validBoxes[i].verts[3],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"cd"%0%0).str());
-					viz.addLine(validBoxes[i].verts[3],validBoxes[i].verts[0],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"da"%0%0).str());
-
-					viz.addLine(validBoxes[i].verts[4],validBoxes[i].verts[5],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"ef"%0%0).str());
-					viz.addLine(validBoxes[i].verts[5],validBoxes[i].verts[6],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"fg"%0%0).str());
-					viz.addLine(validBoxes[i].verts[6],validBoxes[i].verts[7],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"gh"%0%0).str());
-					viz.addLine(validBoxes[i].verts[7],validBoxes[i].verts[4],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"he"%0%0).str());
-
-					viz.addLine(validBoxes[i].verts[0],validBoxes[i].verts[4],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"ae"%0%0).str());
-					viz.addLine(validBoxes[i].verts[1],validBoxes[i].verts[5],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"bf"%0%0).str());
-					viz.addLine(validBoxes[i].verts[2],validBoxes[i].verts[6],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"cg"%0%0).str());
-					viz.addLine(validBoxes[i].verts[3],validBoxes[i].verts[7],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"dh"%0%0).str());
-
-				}
 				print_with_level(4,"box drawn\n");
+			}
+			for(int i=0;i<validBoxes.size();++i){
+				print_with_level(4,"Valid Box gen\n");
+
+				Eigen::Vector3f zAxisToTop(boxes[i].transformation_matrix.block<3,1>(0,2));
+				zAxisToTop*=((validBoxes[i].height+0.01f)*(-0.5f));
+				pcl::PointXYZ text_centroid(boxes[i].centroid.x+zAxisToTop.x(),boxes[i].centroid.y+zAxisToTop.y(),boxes[i].centroid.z+zAxisToTop.z());
+
+				boost::format obj_locator("%s\n\t%s\n\tM:%s\n\tM:%s\n\tM:%s\n\tqw:%.3f\n\tqx:%.3f\n\tqy:%.3f\n\tqz:%.3f");
+
+				viz.addText3D((obj_locator%boxes[i].name
+					%validBoxes[i].reference_colour.name
+					%(validBoxes[i].centroid.z>0?"forward":"back")
+					%(validBoxes[i].centroid.y>0?"up":"down")
+					%(validBoxes[i].centroid.x>0?"right":"left")
+					%validBoxes[i].quaternion.w()
+					%validBoxes[i].quaternion.x()
+					%validBoxes[i].quaternion.y()
+					%validBoxes[i].quaternion.z()
+					).str(),text_centroid,0.01,255,255,255,(cloud_labelling%i%"vname"%0%0).str());
+
+				viz.addLine(validBoxes[i].verts[0],validBoxes[i].verts[1],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vab"%0%0).str());
+				viz.addLine(validBoxes[i].verts[1],validBoxes[i].verts[2],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vbc"%0%0).str());
+				viz.addLine(validBoxes[i].verts[2],validBoxes[i].verts[3],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vcd"%0%0).str());
+				viz.addLine(validBoxes[i].verts[3],validBoxes[i].verts[0],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vda"%0%0).str());
+
+				viz.addLine(validBoxes[i].verts[4],validBoxes[i].verts[5],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vef"%0%0).str());
+				viz.addLine(validBoxes[i].verts[5],validBoxes[i].verts[6],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vfg"%0%0).str());
+				viz.addLine(validBoxes[i].verts[6],validBoxes[i].verts[7],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vgh"%0%0).str());
+				viz.addLine(validBoxes[i].verts[7],validBoxes[i].verts[4],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vhe"%0%0).str());
+
+				viz.addLine(validBoxes[i].verts[0],validBoxes[i].verts[4],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vae"%0%0).str());
+				viz.addLine(validBoxes[i].verts[1],validBoxes[i].verts[5],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vbf"%0%0).str());
+				viz.addLine(validBoxes[i].verts[2],validBoxes[i].verts[6],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vcg"%0%0).str());
+				viz.addLine(validBoxes[i].verts[3],validBoxes[i].verts[7],validBoxes[i].reference_colour.rgb.x(),validBoxes[i].reference_colour.rgb.y(),validBoxes[i].reference_colour.rgb.z(),(cloud_labelling%i%"vdh"%0%0).str());
+
+				print_with_level(4,"valid box drawn\n");
 			}
 		}
 
@@ -1858,8 +2067,6 @@ private:
 					%(h.normal.y()>0?"up":"down")
 					%(h.normal.x()>0?"right":"left")
 					).str(),h.centroid,0.01,255,255,255,(hand_namer%i%"text").str());
-				//pcl::PointXYZ arrow_tip(h.centroid.x+(0.05*h.normal.x()),h.centroid.y+(0.05*h.normal.y()),h.centroid.z+(0.05*h.normal.z()));
-				//viz.addArrow(arrow_tip,h.centroid,0,0,255,false,(hand_namer%i%"normal").str());
 			}
 		}
 
@@ -1893,6 +2100,7 @@ private:
 	RefPointType scan_object_centroid_;
 	pcl::ModelCoefficients::Ptr coefficients;
 	bool plane_vision_;
+	float plane_distance;
 
 	std::vector<Box> boxes;
 	std::vector<Box> validBoxes;
@@ -1976,15 +2184,15 @@ int main (int argc, char** argv)
 	}
 
 	//Setup colour library (could be XML but not needed yet)
-	col_lib.add(PrimitiveColour("Black",-1,0,Eigen::Vector3d(0,0,0)));
-	col_lib.add(PrimitiveColour("Red",0,15,Eigen::Vector3d(1,0,0)));
-	col_lib.add(PrimitiveColour("Red",340,360,Eigen::Vector3d(1,0,0)));
-	col_lib.add(PrimitiveColour("Orange",15,45,Eigen::Vector3d(1,0.65,0)));
-	col_lib.add(PrimitiveColour("Yellow",45,60,Eigen::Vector3d(1,1,0)));
-	col_lib.add(PrimitiveColour("Green",60,150,Eigen::Vector3d(0,1,0)));
-	col_lib.add(PrimitiveColour("Blue",150,250,Eigen::Vector3d(0,0,1)));
-	col_lib.add(PrimitiveColour("Purple",250,290,Eigen::Vector3d(0.62,0,1)));
-	col_lib.add(PrimitiveColour("Pink",290,340,Eigen::Vector3d(1,0,1)));
+	col_lib.add(PrimitiveColour("black",-1,0,Eigen::Vector3d(0,0,0)));
+	col_lib.add(PrimitiveColour("red",0,15,Eigen::Vector3d(1,0,0)));
+	col_lib.add(PrimitiveColour("red",340,360,Eigen::Vector3d(1,0,0)));
+	col_lib.add(PrimitiveColour("orange",15,45,Eigen::Vector3d(1,0.65,0)));
+	col_lib.add(PrimitiveColour("yellow",45,60,Eigen::Vector3d(1,1,0)));
+	col_lib.add(PrimitiveColour("green",60,150,Eigen::Vector3d(0,1,0)));
+	col_lib.add(PrimitiveColour("blue",150,250,Eigen::Vector3d(0,0,1)));
+	col_lib.add(PrimitiveColour("purple",250,290,Eigen::Vector3d(0.62,0,1)));
+	col_lib.add(PrimitiveColour("pink",290,340,Eigen::Vector3d(1,0,1)));
 
 	//Start OSC Server
 	boost::thread oscServer(DMRListener);
