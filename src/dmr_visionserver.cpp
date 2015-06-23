@@ -138,6 +138,7 @@ int lost_object_counter(0);
 float percentage_move(0.2);
 float minimum_move(0.01);
 pcl::PointXYZ offset(0,0,0.2);
+bool export_objects(false);
 
 //Objects
 Cloud::Ptr cloud_pass_;
@@ -151,6 +152,7 @@ std::string coef_point_filename_("relLocation.txt");
 boost::format object_locator_("%s/%s");
 int poss_objects_(0);
 int out_file_num(0);
+Eigen::Matrix3f camToTool(3,3);
 
 //OSC Temp
 boost::mutex oscMutex;
@@ -417,8 +419,6 @@ Eigen::Matrix4f boxTrans( Eigen::Vector3f zAxis, Eigen::Vector3f xAxis, pcl::Poi
 	tM.block<3,1>(0,0)=tM.block<3,1>(0,1).cross(zAxis);
 	tM.block<3,1>(0,3)<<centroid.x,centroid.y,centroid.z;
 	return tM;
-
-
 }
 
 pcl::PointXYZ trans(pcl::PointXYZ pt, Eigen::Vector3f vec){
@@ -517,8 +517,12 @@ Eigen::Quaternionf slerpercentage(Eigen::Quaternionf quat, float percentage, flo
 
 	float sinHalfTheta(std::sqrt(1.0f-(cosHalfTheta*cosHalfTheta)));
 
-	if(std::abs(sinHalfTheta)<0.001f){
+	if(std::fabs(sinHalfTheta)<0.001f){
+	nQ.w()*=0.5f;
 	nQ.w()+=0.5f;
+	nQ.x()*=0.5f;
+	nQ.y()*=0.5f;
+	nQ.z()*=0.5f;
 	nQ.normalize();
 	return nQ;
 	}
@@ -602,6 +606,7 @@ struct Box{
 	float length;
 	float height;
 	Eigen::Matrix4f transformation_matrix;
+	Eigen::Quaternionf base_quaternion;
 	Eigen::Quaternionf quaternion;
 	void calcVerts();
 	void calcQuat();
@@ -654,42 +659,34 @@ void Box::calcVerts(){
 }
 
 void Box::calcQuat(){
-	quaternion=Eigen::Quaternionf(transformation_matrix.block<3,3>(0,0));
+	base_quaternion=Eigen::Quaternionf(transformation_matrix.block<3,3>(0,0));
 }
 
 void Box::movify(){
-	
-quaternion=slerpercentage(quaternion,percentage_move,0.1);
-pcl::PointXYZ new_loc(centroid);
+transformation_matrix.block<3,3>(0,0)=camToTool*transformation_matrix.block<3,3>(0,0);
+transformation_matrix.block<3,1>(0,0)=transformation_matrix.block<3,1>(0,1);
+transformation_matrix.block<3,1>(0,1)=transformation_matrix.block<3,1>(0,2).cross(transformation_matrix.block<3,1>(0,0));
+calcQuat();
+quaternion=slerpercentage(base_quaternion,percentage_move,0.1);
+Eigen::Vector3f relPos(centroid.getVector3fMap());
+relPos.x()-=offset.x;
+relPos.y()-=offset.y;
+relPos.z()-=offset.z;
 if(approach){
 	Eigen::Vector3f zAxis(transformation_matrix.block<3,1>(0,2));
 	zAxis*=-0.15f;
-	new_loc.x+=zAxis.x();
-	new_loc.y+=zAxis.y();
-	new_loc.z+=zAxis.z();
-
-	Eigen::Vector3f relPos(new_loc.getVector3fMap());
+	relPos.x()+=zAxis.x();
+	relPos.y()+=zAxis.y();
+	relPos.z()+=zAxis.z();
 	if(relPos.norm()<=minimum_move){
 		approach=false;
 	}
-	relPos*=1000.0f;
-	relPos*=percentage_move;
-
-	centroid.x=relPos.x();
-	centroid.y=relPos.y();
-	centroid.z=relPos.z();
-
-}else{
-
-	Eigen::Vector3f relPos(new_loc.getVector3fMap());
-	relPos*=1000.0f;
-	relPos*=percentage_move;
-
-	centroid.x=relPos.x();
-	centroid.y=relPos.y();
-	centroid.z=relPos.z();
-
 }
+	relPos*=1000.0f;
+	relPos*=percentage_move;
+	centroid.x=relPos.x();
+	centroid.y=relPos.y();
+	centroid.z=relPos.z();
 }
 
 struct PrimitiveBox{
@@ -717,43 +714,46 @@ PrimitiveBox::PrimitiveBox(float l, float w, float h){
 struct SimpleHand{
 	pcl::PointXYZ centroid;
 	Eigen::Vector3f normal;
+	Eigen::Matrix4f transformation_matrix;
 	Eigen::Quaternionf quat;
+	Eigen::Quaternionf base_quaternion;
+	Eigen::Quaternionf raw_quat;
 	bool open;
 	int openness;
 	void movify();
+	void calcQuat();
 };
 
-void SimpleHand::movify(){
-quat=slerpercentage(quat,percentage_move,0.1);
-pcl::PointXYZ new_loc(centroid);
-if(approach){
-	normal*=0.15f;
-	new_loc.x+=normal.x();
-	new_loc.y+=normal.y();
-	new_loc.z+=normal.z();
+void SimpleHand::calcQuat(){
+	base_quaternion=Eigen::Quaternionf(transformation_matrix.block<3,3>(0,0));
+	base_quaternion.normalize();
+}
 
-	Eigen::Vector3f relPos(new_loc.getVector3fMap());
+void SimpleHand::movify(){
+transformation_matrix.block<3,3>(0,0)=camToTool*transformation_matrix.block<3,3>(0,0);
+transformation_matrix.block<3,1>(0,0)=transformation_matrix.block<3,1>(0,1);
+transformation_matrix.block<3,1>(0,1)=transformation_matrix.block<3,1>(0,2).cross(transformation_matrix.block<3,1>(0,0));
+calcQuat();
+base_quaternion.w()=-base_quaternion.w();
+quat=slerpercentage(base_quaternion,percentage_move,0.1);
+Eigen::Vector3f relPos(centroid.getVector3fMap());
+relPos.x()-=offset.x;
+relPos.y()-=offset.y;
+relPos.z()-=offset.z;
+if(approach){
+	normal*=-0.15f;
+	relPos.x()+=normal.x();
+	relPos.y()+=normal.y();
+	relPos.z()+=normal.z();
 	if(relPos.norm()<=minimum_move){
 		approach=false;
 	}
-	relPos*=1000.0f;
-	relPos*=percentage_move;
-
-	centroid.x=relPos.x();
-	centroid.y=relPos.y();
-	centroid.z=relPos.z();
-
-}else{
-
-	Eigen::Vector3f relPos(new_loc.getVector3fMap());
-	relPos*=1000.0f;
-	relPos*=percentage_move;
-
-	centroid.x=relPos.x();
-	centroid.y=relPos.y();
-	centroid.z=relPos.z();
-
 }
+	relPos*=1000.0f;
+	relPos*=percentage_move;
+	centroid.x=relPos.x();
+	centroid.y=relPos.y();
+	centroid.z=relPos.z();
 }
 
 class DMRPacketListener : public osc::OscPacketListener {
@@ -826,7 +826,7 @@ public:
 
 	RealSenseTracker (pcl::RealSenseGrabber& grabber)
 		: grabber_ (grabber)
-		, viewer_ ("Seb's (Soon to be) Badass Robot Eyes")
+		, viewer_ ("Seb's Badass Robot Eyes")
 		, window_ (3)
 		, threshold_ (7)
 		, temporal_filtering_ (pcl::RealSenseGrabber::RealSense_None)
@@ -840,7 +840,6 @@ public:
 		viewer_.registerKeyboardCallback (&RealSenseTracker::keyboardCallback, *this);
 		viewer_.setBackgroundColor(0,0,0);
 		viewer_.setRepresentationToWireframeForAllActors();
-		//out_socket.SetEnableBroadcast(true);
 	}
 
 	~RealSenseTracker ()
@@ -939,15 +938,18 @@ public:
 								closest_dist=dist;
 							}
 						}
+						obj_distance=closest_dist;
+						closest_obj_centroid=closest.centroid;
 						closest.movify();
-						if(closest.openness<60){
+						if(!closest.open){
 							closest_dist+=100;
 						}else if(!approach && closest_dist<0.07){
 							closest_dist-=0.05;
 						}
+
 						p << osc::BeginBundleImmediate
 						<< osc::BeginMessage( "/io" ) 
-						<< "objdist" << (float)closest_dist << osc::EndMessage
+						<< "objdist" << (float)closest_dist*1000.0f << osc::EndMessage
 						<< osc::BeginMessage( "/io" ) 
 						<< "objx" << (float)closest.centroid.x << osc::EndMessage
 						<< osc::BeginMessage( "/io" ) 
@@ -970,15 +972,17 @@ public:
 					}else if(!(std::strcmp(search_obj.c_str(),"")==0)){
 						if(validBoxes.size()>0){
 						Box closest;
-												float closest_dist(std::numeric_limits<float>::max());
+						float closest_dist(std::numeric_limits<float>::max());
 						for(std::vector<Box>::iterator cit=validBoxes.begin(); cit!=validBoxes.end(); ++cit){
 							Box b=*cit;
-							float dist(b.centroid.getVector3fMap().norm());
+							float dist(b.centroid.getVector3fMap().norm()*1000.0f);
 							if(dist<closest_dist){
 								closest=b;
 								closest_dist=dist;
 							}
 						}
+						obj_distance=closest_dist;
+						closest_obj_centroid=closest.centroid;
 						closest.movify();
 						p << osc::BeginBundleImmediate
 						<< osc::BeginMessage( "/io" ) 
@@ -1004,16 +1008,17 @@ public:
 						}
 					}
 					
-					//Create new message/bundle with coefficients closest point to 0,0,0's distance
+					//Create new message/bundle with distance from coefficients' closest point to targetpoint (offset)
 					char b[OUTPUT_BUFFER_SIZE];
 					osc::OutboundPacketStream d( b, OUTPUT_BUFFER_SIZE );
 					float dist(0);
 					if(plane_vision_){
-						dist=planeDist(*coefficients,pcl::PointXYZ(0,0,0.2));
+						dist=planeDist(*coefficients,offset);
 					}
+					plane_distance=dist;
 						d << osc::BeginBundleImmediate
 						<< osc::BeginMessage( "/io" ) 
-						<< "distance" << (float)dist << osc::EndMessage
+						<< "distance" << (float)dist*1000.0f << osc::EndMessage
 						<< osc::EndBundle;
 						out_socket.Send(d.Data(), d.Size());
 					
@@ -1060,6 +1065,9 @@ private:
 				hands.clear();
 				subBoxes.clear();
 				objects_cloud_.reset(new pcl::PointCloud<pcl::PointXYZRGBA>);
+				closest_obj_centroid=pcl::PointXYZ(0,0,0);
+				obj_distance=0.0f;
+				plane_distance=0.0f;
 
 				if(hand_search){
 
@@ -1082,14 +1090,13 @@ private:
 
 									PXCPoint4DF32 palm_orientation=hand->QueryPalmOrientation();
 									Eigen::Quaternionf palm_up(palm_orientation.w,palm_orientation.x,palm_orientation.y,palm_orientation.z);
-									
+									h.raw_quat=palm_up;
 									Eigen::Matrix3f hand_rot_mat=palm_up.toRotationMatrix();
 									h.normal=hand_rot_mat.block<3,1>(0,2);
-									hand_rot_mat.block<3,1>(0,2)*=-1.0f;
-									hand_rot_mat.block<3,1>(0,0)=Eigen::Vector3f(1.0f,0.0f,0.0f);
-									hand_rot_mat.block<3,1>(0,1)=hand_rot_mat.block<3,1>(0,2).cross(hand_rot_mat.block<3,1>(0,0));
+									h.normal*=sgn(cosineSimilarity(h.normal,Eigen::Vector3f(0,0,1)));
+									h.transformation_matrix=boxTrans(h.normal,Eigen::Vector3f(1.0f,0.0f,0.0f),h.centroid);
 
-									h.quat=Eigen::Quaternionf(hand_rot_mat);
+									h.calcQuat();
 
 									h.openness=hand->QueryOpenness();
 
@@ -1217,7 +1224,7 @@ private:
 								pcl::compute3DCentroid<pcl::PointXYZRGBA>(*cluster_cloud_, cluster_centroid_);
 								pcl::PointXYZRGBA centroid_;
 								centroid_.x=cluster_centroid_[0];
-								centroid_.y=	cluster_centroid_[1];
+								centroid_.y=cluster_centroid_[1];
 								centroid_.z=cluster_centroid_[2];
 
 
@@ -1468,7 +1475,6 @@ private:
 												box.lightness=boxHSL.z();
 												box.reference_colour=col_lib.getColour(box.hue);
 
-
 												box.centroid.x/=4.0;
 												box.centroid.y/=4.0;
 												box.centroid.z/=4.0;
@@ -1503,15 +1509,12 @@ private:
 
 											for(int i=0;i<3;++i){
 
-
 												totNumPts+=float(box.faces[i].points->points.size());
 												for(int j=0;j<box.faces[i].points->points.size();++j){
-													//cout << box.faces[i].points->points[j] << endl;
 													r+=box.faces[i].points->points[j].r;
 													g+=box.faces[i].points->points[j].g;
 													b+=box.faces[i].points->points[j].b;
 												}
-												cout << "Cluster interim RGB: " << r << ", " << g << ", " << b << ", " << totNumPts << endl;
 												bool par_plane(false);
 												if(std::abs(cosineSimilarity(coefficients,box.faces[i].coeffs))>parallel_threshold){
 													par_plane=true;
@@ -1568,12 +1571,9 @@ private:
 												//Storage
 												box.faces.push_back(nBPP);
 											}
-											cout << "Cluster RGB: " << r << ", " << g << ", " << b << endl;
 											r/=totNumPts;
 											g/=totNumPts;
 											b/=totNumPts;
-											cout << "Cluster RGB: " << r << ", " << g << ", " << b << endl;
-											cout << "Tot RGB Pts: " << totNumPts << endl;
 
 											Eigen::Vector3f boxHSL(rgbToHSL((r),(g),(b)));
 											box.hue=boxHSL.x();
@@ -1587,7 +1587,6 @@ private:
 											box.valid_box=true;
 											break;
 											   }
-
 											   //End of box generation switch
 										}
 
@@ -1614,22 +1613,11 @@ private:
 											r/=totNumPts;
 											g/=totNumPts;
 											b/=totNumPts;
-											cout << "Cluster RGB: " << r << ", " << g << ", " << b << endl;
-											cout << "Tot RGB Pts: " << totNumPts << endl;
-
 											Eigen::Vector3f boxHSL(rgbToHSL((r),(g),(b)));
-
-											cout << "HSL: " << boxHSL << endl;
-
 											box.hue=boxHSL.x();
 											box.saturation=boxHSL.y();
 											box.lightness=boxHSL.z();
-
-											cout << "Box HSL: " << box.hue << ", " << box.saturation << ", " << box.lightness << endl;
-
 											box.reference_colour=col_lib.getColour(box.hue);
-
-											cout << "Colour Found: " << box.reference_colour.name << endl;
 
 											//Project all points to plane
 											pcl::PointCloud<pcl::PointXYZRGBA>::Ptr bpp_projected (new pcl::PointCloud<pcl::PointXYZRGBA>);
@@ -1700,7 +1688,6 @@ private:
 												yDif=yvals.back()-yvals.front();
 												area=(xDif*1000)*(yDif*1000);
 												if(area<min_area){
-													//print_with_level(4,"Minimum Approved\n");
 													min_area=area;
 													xAxis=xAxis_temp;
 													yAxis=yAxis_temp;
@@ -1740,11 +1727,7 @@ private:
 												box.centroid.y=nBPP.centroid.y;
 												box.centroid.z=nBPP.centroid.z;
 											}
-
-											cout<<"Single Faced Box Dims: "<< box.dims[0] << ", " << box.dims[1] << ", " << box.dims[2] <<endl;
-
 											box.valid_box=true;
-
 										}
 
 										//Test box against library
@@ -1774,35 +1757,19 @@ private:
 														Eigen::Vector3f yaxis(box.axes[lIndex]);
 														Eigen::Vector3f zaxis(box.axes[hIndex]);
 
-														float hSimZ(cosineSimilarity(zaxis,Eigen::Vector3f(0,0,1)));
-														float hSimY(cosineSimilarity(zaxis,Eigen::Vector3f(0,1,0)));
-														float hSimX(cosineSimilarity(zaxis,Eigen::Vector3f(1,0,0)));
+														cout << "Base XAxis: " << xaxis <<endl;
+														cout << "Base YAxis: " << yaxis <<endl;
+														cout << "Base ZAxis: " << zaxis <<endl;
+														cout << "Length: " << box.dims[lIndex] <<endl;
+														cout << "Width: " << box.dims[wIndex] <<endl;
+														cout << "Height: " << box.dims[hIndex] <<endl;
 
-														float wSimA,wSimB;
-
-														if(std::abs(hSimZ)>=std::abs(hSimY)&&std::abs(hSimZ)>=std::abs(hSimX)){
-															zaxis*=sgn(hSimZ);
-															wSimA=cosineSimilarity(xaxis,Eigen::Vector3f(1,0,0));
-															wSimB=cosineSimilarity(xaxis,Eigen::Vector3f(0,1,0));
-														}else if(std::abs(hSimY)>=std::abs(hSimX)){
-															zaxis*=sgn(hSimY);
-															wSimA=cosineSimilarity(xaxis,Eigen::Vector3f(0,0,-1));
-															wSimB=cosineSimilarity(xaxis,Eigen::Vector3f(1,0,0));
-														}else{
-															zaxis*=sgn(hSimX);
-															wSimA=cosineSimilarity(xaxis,Eigen::Vector3f(0,0,-1));
-															wSimB=cosineSimilarity(xaxis,Eigen::Vector3f(0,1,0));
-														}
-
-														if(std::abs(wSimA)>=std::abs(wSimB)){
-															xaxis*=sgn(wSimA);
-														}else{
-															xaxis*=sgn(wSimB);
-														}
+														zaxis*=sgn(cosineSimilarity(zaxis,Eigen::Vector3f(0,0,1)));
+														xaxis*=sgn(cosineSimilarity(xaxis,Eigen::Vector3f(1,0,0)));
 
 														box.transformation_matrix=boxTrans(zaxis,xaxis,box.centroid);
+														cout << box.transformation_matrix << endl;
 														box.calcVerts();
-														box.calcQuat();
 														box.faces.clear();
 
 													}else{
@@ -1831,7 +1798,6 @@ private:
 									}
 									//End of for all clusters								
 								}
-
 								break;
 								//end of algorithm switch case 4
 								   }
@@ -1845,7 +1811,55 @@ private:
 					}
 				}
 			}
-			//file_cloud_cb<pcl::cuda::Device>(cloud);
+
+			if(export_objects){
+			std::ofstream out((boost::format("%i_%s")%out_file_num%coef_point_filename_).str());
+				++out_file_num;
+
+				if(plane_vision_){
+					out << "Plane:\n" << "Coefficients: " << coefficients->values[0] << " " << coefficients->values[1] << " " << coefficients->values[2] << " " << coefficients->values[3] << std::endl;
+				}else{
+					out << "Plane:\n" << std::endl;
+				}
+				if(hand_search){
+					for(int i=0; i<hands.size();++i){
+					out << "Hand: " << std::endl;
+					hands[i].movify();
+					out	<< "Centroid: " << hands[i].centroid.x << ", " << hands[i].centroid.y << "," << hands[i].centroid.z << std::endl;
+					out << "Normal: " << hands[i].normal.x() << ", " << hands[i].normal.y() << "," << hands[i].normal.z() << std::endl;
+					out << "RawQuat: " << hands[i].raw_quat.w() << ", " << hands[i].raw_quat.x() << ", " << hands[i].raw_quat.y() << ", " << hands[i].raw_quat.z() << std::endl;
+					out << "Quaternion: " << hands[i].base_quaternion.w() << ", " << hands[i].base_quaternion.x() << ", " << hands[i].base_quaternion.y() << ", " << hands[i].base_quaternion.z() << std::endl;
+					out << "PartialQuat: " << hands[i].quat.w() << ", " << hands[i].quat.x() << ", " << hands[i].quat.y() << ", " << hands[i].quat.z() << std::endl;
+				}
+				}else{
+				out << "Valid Boxes: " << validBoxes.size() << std::endl;
+				for(int i=0; i<validBoxes.size();++i){
+					Box tempBox(validBoxes[i]);
+					out << "Box: " << validBoxes[i].name << std::endl;
+					out	<< "Centroid: " << tempBox.centroid.x*1000.0f << ", " << tempBox.centroid.y*1000.0f << ", " << tempBox.centroid.z*1000.0f << std::endl;
+					tempBox.movify();
+					out << "Transformatrix: " << tempBox.transformation_matrix << std::endl;
+					out << "Quaternion: " << tempBox.base_quaternion.w() << ", " << tempBox.base_quaternion.x() << ", " << tempBox.base_quaternion.y() << ", " << tempBox.base_quaternion.z() << std::endl;
+					out << "Colour: " << tempBox.reference_colour.name << std::endl;
+					out	<< "PartialCent: " << tempBox.centroid.x << ", " << tempBox.centroid.y << ", " << tempBox.centroid.z << std::endl;
+					out << "PartialQuat: " << tempBox.quaternion.w() << ", " << tempBox.quaternion.x() << ", " << tempBox.quaternion.y() << ", " << tempBox.quaternion.z() << std::endl;
+				}
+				for(int i=0; i<boxes.size();++i){
+					out << "Box: " << boxes[i].name << std::endl;
+					out	<< "Centroid: " << boxes[i].centroid.x*1000.0f << ", " << boxes[i].centroid.y*1000.0f << ", " << boxes[i].centroid.z*1000.0f << std::endl;
+					boxes[i].movify();
+					out << "Transformatrix: " << boxes[i].transformation_matrix << std::endl;
+					out << "Quaternion: " << boxes[i].base_quaternion.w() << ", " << boxes[i].base_quaternion.x() << ", " << boxes[i].base_quaternion.y() << ", " << boxes[i].base_quaternion.z() << std::endl;
+					out << "Colour: " << boxes[i].reference_colour.name << std::endl;
+					out	<< "PartialCent: " << boxes[i].centroid.x << ", " << boxes[i].centroid.y << ", " << boxes[i].centroid.z << std::endl;
+					out << "PartialQuat: " << boxes[i].quaternion.w() << ", " << boxes[i].quaternion.x() << ", " << boxes[i].quaternion.y() << ", " << boxes[i].quaternion.z() << std::endl;
+				}
+				}
+				out.close();
+				export_objects=false;
+			
+			}
+
 			got_new_cloud_ = true;
 			print_with_level(3,"Done With Callback\n");
 		}
@@ -1893,22 +1907,7 @@ private:
 
 			if (event.getKeyCode () == 'l')
 			{
-				std::ofstream out((boost::format("%i_%s")%out_file_num%coef_point_filename_).str());
-				++out_file_num;
-
-				if(plane_vision_){
-					out << "Plane:\n" << "Coefficients: " << coefficients->values[0] << " " << coefficients->values[1] << " " << coefficients->values[2] << " " << coefficients->values[3] << std::endl;
-				}else{
-					out << "Plane:\n" << std::endl;
-				}
-				out << "Boxes: " << validBoxes.size() << std::endl;
-				for(int i=0; i<validBoxes.size();++i){
-					out << "Box: " << validBoxes[i].name << std::endl;
-					out	<< "Centroid: " << validBoxes[i].centroid.x*1000.0f << " " << validBoxes[i].centroid.y*1000.0f << " " << validBoxes[i].centroid.z*1000.0f << std::endl;
-					out << "Quaternion: " << validBoxes[i].quaternion.w() << " " << validBoxes[i].quaternion.x() << " " << validBoxes[i].quaternion.y() << " " << validBoxes[i].quaternion.z() << std::endl;
-					out << "Colour: " << validBoxes[i].reference_colour.name << std::endl;
-				}
-				out.close();
+				export_objects=true;
 			}
 
 			displaySettings ();
@@ -1923,28 +1922,25 @@ private:
 		boost::format name_fmt ("text%i");
 		const char* TF[] = {"off", "median", "average"};
 		std::vector<boost::format> entries;
-		entries.push_back(boost::format("Mode: %s") % (tracking_?"Tracking":"Scanning"));
-		entries.push_back (boost::format ("Track Mode: %i") % search_mode_);
-		entries.push_back (boost::format ("Algorithm: %s") % algorithms[algorithm_]);
-		if(!tracking_){
-			entries.push_back (boost::format ("Potentially Interesting Objects: %i") % poss_objects_);
-		}
+		entries.push_back (boost::format ("%.1f fps") % grabber_.getFramesPerSecond ());
+		
+		// Current Model
+		entries.push_back(boost::format("Distance to closest instance: %-0.3f") % obj_distance);
+		entries.push_back(boost::format("Position of closest instance: %-0.3f, %-0.3f, %-0.3f") % closest_obj_centroid.x % closest_obj_centroid.y % closest_obj_centroid.z);
+		entries.push_back(boost::format("Model: %s") % search_obj);
 		if(hands_available){
 			entries.push_back (boost::format ("Num Hands: %i") % numHands);
 		}
 		entries.push_back (boost::format ("Found Objects: %i") % boxes.size());
-		// Framerate
-		entries.push_back (boost::format ("%.1f fps") % grabber_.getFramesPerSecond ());
-		// Confidence threshold
-		entries.push_back (boost::format ("confidence threshold: %i") % threshold_);
-		// Current Model (TODO: Update with real model names)
-		entries.push_back(boost::format("Model: %s") % search_obj);
+		entries.push_back (boost::format ("Plane Distance: %-0.3f") % plane_distance);
+		entries.push_back (boost::format ("Algorithm: %s") % algorithms[algorithm_]);	
 
-		// Position (TODO: Update with real closest model positions)
-		entries.push_back(boost::format("Position of closest instance: %s") % "TODO");
-		// Temporal filter settings
+		// Settings
+		entries.push_back (boost::format ("confidence threshold: %i") % threshold_);
 		std::string tfs = boost::str (boost::format (", window size %i") % window_);
 		entries.push_back (boost::format ("temporal filtering: %s%s") % TF[temporal_filtering_] % (temporal_filtering_ == pcl::RealSenseGrabber::RealSense_None ? "" : tfs));
+		entries.push_back (boost::format ("Track Mode: %i") % search_mode_);
+		entries.push_back(boost::format("Mode: %s") % (tracking_?"Tracking":"Scanning"));
 		for (size_t i = 0; i < entries.size (); ++i)
 		{
 			std::string name = boost::str (name_fmt % i);
@@ -1979,19 +1975,19 @@ private:
 	{
 		print_with_level(4,"Viz start\n");
 		viz.removeAllShapes();
-
 		boost::format obj_name("found_obj_%s%i");
 		for(int i=0;i<50;++i) viz.removePointCloud((obj_name%""%i).str());
 		print_with_level(4,"Algorithm specific viz\n");
 
 		if(algorithm_==4){
 			boost::format cloud_labelling("box_%i_%s_%i_%i");
-
+		for(int i=0;i<10;++i) viz.removeText3D((cloud_labelling%i%"name"%0%0).str());
+		for(int i=0;i<10;++i) viz.removeText3D((cloud_labelling%i%"vname"%0%0).str());
 			for(int i=0;i<boxes.size();++i){
 				print_with_level(4,"Box gen\n");
 
 				Eigen::Vector3f zAxisToTop(boxes[i].transformation_matrix.block<3,1>(0,2));
-				zAxisToTop*=((validBoxes[i].height+0.01f)*(-0.5f));
+				zAxisToTop*=((boxes[i].height+0.01f)*(-0.5f));
 				pcl::PointXYZ text_centroid(boxes[i].centroid.x+zAxisToTop.x(),boxes[i].centroid.y+zAxisToTop.y(),boxes[i].centroid.z+zAxisToTop.z());
 
 				std::string cubeName((cloud_labelling%i%"validbox"%0%0).str());
@@ -2055,17 +2051,17 @@ private:
 
 		if(hand_search){	
 			boost::format hand_namer("hand_%i_%s");
-			boost::format hand_typer("hand_%i_%s@%i%%\n\tM:%s\n\tM:%s\n\tM:%s\n\tR:%s\n\tR:%s\n\tR:%s");
+			boost::format hand_typer("hand_%i_%s@%i%%\n\tM:%-1.3f\n\tM:%-1.3f\n\tM:%-1.3f\n\tNX:%-1.3f\n\tNY:%-1.3f\n\tNZ:%-1.3f");
 			for(int i=0; i<hands.size();++i){
 				SimpleHand h=hands[i];
 				viz.addSphere(h.centroid,0.01,255,255,0,(hand_namer%i%"centroid").str());
 				viz.addText3D((hand_typer%i%(h.open?"open":"closed")%h.openness
-					%(h.centroid.z>0?"forward":"back")
-					%(h.centroid.y>0?"up":"down")
-					%(h.centroid.x>0?"right":"left")
-					%(h.normal.z()>0?"forward":"back")
-					%(h.normal.y()>0?"up":"down")
-					%(h.normal.x()>0?"right":"left")
+					%(h.centroid.x)
+					%(h.centroid.y)
+					%(h.centroid.z)
+					%(h.normal.x())
+					%(h.normal.y())
+					%(h.normal.z())
 					).str(),h.centroid,0.01,255,255,255,(hand_namer%i%"text").str());
 			}
 		}
@@ -2101,6 +2097,8 @@ private:
 	pcl::ModelCoefficients::Ptr coefficients;
 	bool plane_vision_;
 	float plane_distance;
+	pcl::PointXYZ closest_obj_centroid;
+	float obj_distance;
 
 	std::vector<Box> boxes;
 	std::vector<Box> validBoxes;
@@ -2124,6 +2122,7 @@ int main (int argc, char** argv)
 		pcl::console::setVerbosityLevel(pcl::console::L_ALWAYS);
 	}
 
+	camToTool<<0,1,0,1,0,0,0,0,1;
 	parseCommandLine(argc,argv);
 
 	//Read in all objects

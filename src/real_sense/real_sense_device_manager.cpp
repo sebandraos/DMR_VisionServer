@@ -64,7 +64,10 @@ makePXCSharedPtr (T* resource)
 boost::shared_ptr<PXCSession>
 createPXCSession ()
 {
-  PXCSession* s = PXCSession::CreateInstance ();
+  PXCSession* s = PXCSession::CreateInstance();
+  std::cout << "Coord Enum Base: " << s->QueryCoordinateSystem() << std::endl;
+  s->SetCoordinateSystem(PXCSession::COORDINATE_SYSTEM_REAR_OPENCV);
+  std::cout << "Coord Enum Adjusted: " << s->QueryCoordinateSystem() << std::endl;
   if (!s)
     THROW_IO_EXCEPTION ("failed to create RealSense session");
   return makePXCSharedPtr (s);
